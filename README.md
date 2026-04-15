@@ -1,5 +1,25 @@
 # OpenClaw OpenAI-Compatible Facade
 
+不修改 OpenClaw 源码，让第三方 OpenAI-compatible `Responses` provider 在 OpenClaw 主 Agent 路径里恢复 prompt cache / cache read 的本地 facade 方案。
+
+## 为什么值得分享
+
+这个仓库解决的是一个很具体、但很常见的问题：
+
+- 第三方 provider 明明自己支持 `prompt_cache_key`
+- 本地 Codex / 其他直连客户端也确实能读缓存
+- 但 OpenClaw 主 Agent 走到 provider 后，cache key 可能在请求链路里被剥掉
+
+这个项目不碰 OpenClaw 源码，而是用“本地 facade + 配置层切换”把 OpenClaw 重新带回它认可的 OpenAI 原生路由。
+
+## 亮点
+
+- 不改 OpenClaw 源码，升级不需要重新 patch
+- 支持多个第三方 provider 复用同一个本地 facade
+- 已实测恢复主 Agent 的真实 `cacheRead`
+- 安装和回滚都提供一键脚本
+- 文档以中文为主，适合直接分享给中文用户
+
 这是一个给 OpenClaw 用的本地 facade 方案，目标是：
 
 - 不修改 OpenClaw 源码
