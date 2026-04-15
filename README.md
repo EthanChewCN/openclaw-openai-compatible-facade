@@ -12,7 +12,8 @@
 
 - OpenClaw 主对话 / Agent 路径
 - 第三方 OpenAI-compatible `Responses` provider
-- macOS + LaunchAgent 环境
+- macOS + LaunchAgent
+- Debian / Ubuntu + `systemd --user`
 
 ## 背景
 
@@ -58,10 +59,15 @@
 
 ### 前置条件
 
-- macOS
-- OpenClaw 已安装，且 Gateway 通过 LaunchAgent 运行
+- macOS 或 Debian / Ubuntu
+- OpenClaw 已安装
 - 已安装 `node`
 - 已安装 `openssl`
+
+运行方式要求：
+
+- macOS：Gateway 通过 LaunchAgent 运行
+- Linux：Gateway 通过 `systemd --user` 运行
 
 ### 单 provider 示例
 
@@ -93,7 +99,7 @@ openclaw agent --agent main --message "reply with exactly ok" --json --timeout 6
 1. 在 `~/.openclaw/local-proxies/openai-compatible-facade` 下创建运行目录
 2. 生成本地 CA 和 `api.openai.com` 叶子证书
 3. 安装 facade 的 LaunchAgent
-4. 修改 OpenClaw Gateway 的 LaunchAgent 环境变量：
+4. 修改 OpenClaw Gateway 的运行时环境：
    - `NODE_EXTRA_CA_CERTS`
    - `HTTP_PROXY`
    - `HTTPS_PROXY`
@@ -106,7 +112,7 @@ openclaw agent --agent main --message "reply with exactly ok" --json --timeout 6
    - 注入 `X-OpenClaw-Facade-Upstream`
    - 注入 `X-OpenClaw-Facade-Provider`
 6. 尝试同步 `~/.openclaw/agents/main/agent/models.json`
-7. 重载 facade 和 Gateway 两个 LaunchAgent
+7. 重载 facade 和 Gateway 服务
 
 ## 配置结果示例
 
@@ -200,7 +206,7 @@ bash scripts/uninstall.sh \
 - 删除 facade 注入的请求头
 - 删除 `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`
 - 把 `NODE_EXTRA_CA_CERTS` 重置为 `/etc/ssl/cert.pem`
-- 停掉 facade LaunchAgent
+- 停掉 facade 服务
 - 重载 Gateway
 
 ## 限制与注意事项
@@ -235,15 +241,19 @@ Gateway 进程会带：
 这里的 CA 不会导入系统钥匙串，而是只通过 `NODE_EXTRA_CA_CERTS` 注入给 Gateway 进程。  
 影响范围只在 OpenClaw Gateway，不会改系统全局 HTTPS 信任。
 
-### 4. 当前仅支持 macOS
+### 4. Linux 依赖 `systemd --user`
 
-脚本依赖：
+Linux 版本按 Debian / Ubuntu 的 `systemd --user` 服务方式实现。
 
-- LaunchAgent
-- `launchctl`
-- `/usr/libexec/PlistBuddy`
+这部分支持已经写进安装/卸载脚本，但当前仓库是在 macOS 环境下完成开发和自检的；如果你准备在 Debian 或 Ubuntu 上使用，建议先在测试机上完整跑一遍安装、验证和回滚流程。
 
-Linux / systemd 暂未支持。
+如果你的环境不能正常运行：
+
+```bash
+systemctl --user status
+```
+
+那这套脚本就不能直接接管 OpenClaw Gateway。
 
 ### 5. OpenClaw 升级后建议重新验证
 

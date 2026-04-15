@@ -8,22 +8,36 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
 const args = process.argv.slice(2);
+const CURRENT_PLATFORM = process.platform;
 
 function fail(message) {
   console.error(`ERROR: ${message}`);
   process.exit(1);
 }
 
-function parseArgs(argv) {
-  const options = {
+function detectPlatformName(platform = CURRENT_PLATFORM) {
+  if (platform === "darwin") return "macos";
+  if (platform === "linux") return "linux";
+  fail(`unsupported platform: ${platform}`);
+}
+
+function defaultOptions() {
+  const platform = detectPlatformName();
+  return {
+    platform,
     stateDir: path.join(os.homedir(), ".openclaw"),
     gatewayPlist: path.join(os.homedir(), "Library/LaunchAgents/ai.openclaw.gateway.plist"),
+    gatewayUnit: "openclaw-gateway.service",
+    systemdUserDir: path.join(os.homedir(), ".config", "systemd", "user"),
     facadeLabel: "ai.openclaw.openai-compatible-facade",
     proxyPort: "19876",
     noReload: false,
     maps: []
   };
+}
 
+function parseArgs(argv) {
+  const options = defaultOptions();
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--map") {
@@ -40,8 +54,20 @@ function parseArgs(argv) {
       options.stateDir = path.resolve(argv[++i] || "");
       continue;
     }
+    if (arg === "--platform") {
+      options.platform = argv[++i] || "";
+      continue;
+    }
     if (arg === "--gateway-plist") {
       options.gatewayPlist = path.resolve(argv[++i] || "");
+      continue;
+    }
+    if (arg === "--gateway-unit") {
+      options.gatewayUnit = argv[++i] || "";
+      continue;
+    }
+    if (arg === "--systemd-user-dir") {
+      options.systemdUserDir = path.resolve(argv[++i] || "");
       continue;
     }
     if (arg === "--proxy-port") {
@@ -59,6 +85,7 @@ function parseArgs(argv) {
     fail(`unknown argument: ${arg}`);
   }
 
+  if (options.platform !== "macos" && options.platform !== "linux") fail(`unsupported --platform value: ${options.platform}`);
   if (options.maps.length === 0) fail("at least one --map provider=https://upstream is required");
   return options;
 }
@@ -68,11 +95,14 @@ function printHelp() {
   node scripts/install.mjs --map custom-beehears=https://api.beehears.com [--map provider2=https://example.com]
 
 Options:
-  --map            Map an OpenClaw provider key to a third-party upstream origin
-  --state-dir      OpenClaw state dir (default: ~/.openclaw)
-  --gateway-plist  Gateway LaunchAgent plist path
-  --proxy-port     Local facade proxy port (default: 19876)
-  --no-reload      Write files only, do not reload launchd services
+  --map               Map an OpenClaw provider key to a third-party upstream origin
+  --platform          Target platform: macos | linux (default: current OS)
+  --state-dir         OpenClaw state dir (default: ~/.openclaw)
+  --gateway-plist     Gateway LaunchAgent plist path (macOS)
+  --gateway-unit      Gateway systemd user unit name (Linux, default: openclaw-gateway.service)
+  --systemd-user-dir  systemd user unit directory (Linux, default: ~/.config/systemd/user)
+  --proxy-port        Local facade proxy port (default: 19876)
+  --no-reload         Write files only, do not reload services
 `);
 }
 
@@ -104,6 +134,7 @@ function timestamp() {
 }
 
 function backupFile(filePath, backupDir) {
+  if (!fs.existsSync(filePath)) return null;
   ensureDir(backupDir);
   const backupPath = path.join(backupDir, `${path.basename(filePath)}.${timestamp()}.bak`);
   fs.copyFileSync(filePath, backupPath);
@@ -129,10 +160,6 @@ function ensurePlistDict(plistPath, keyPath) {
   plistBuddy(plistPath, `Add ${keyPath} dict`);
 }
 
-function removePlistKey(plistPath, keyPath) {
-  plistBuddy(plistPath, `Delete ${keyPath}`, true);
-}
-
 function writeFacadeLaunchAgent(plistPath, runtimeDir, logDir, port, label) {
   const contents = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -148,7 +175,7 @@ function writeFacadeLaunchAgent(plistPath, runtimeDir, logDir, port, label) {
     <integer>1</integer>
     <key>ProgramArguments</key>
     <array>
-      <string>/opt/homebrew/opt/node/bin/node</string>
+      <string>${process.execPath}</string>
       <string>${path.join(runtimeDir, "server.mjs")}</string>
     </array>
     <key>StandardOutPath</key>
@@ -160,7 +187,7 @@ function writeFacadeLaunchAgent(plistPath, runtimeDir, logDir, port, label) {
       <key>HOME</key>
       <string>${os.homedir()}</string>
       <key>PATH</key>
-      <string>/opt/homebrew/opt/node/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+      <string>${process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin"}</string>
       <key>LISTEN_HOST</key>
       <string>127.0.0.1</string>
       <key>LISTEN_PORT</key>
@@ -180,6 +207,45 @@ function writeFacadeLaunchAgent(plistPath, runtimeDir, logDir, port, label) {
 </plist>
 `;
   writeFile(plistPath, contents);
+}
+
+function writeFacadeSystemdUnit(unitPath, runtimeDir, logDir, port) {
+  const contents = `[Unit]
+Description=OpenClaw OpenAI-Compatible Facade
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${process.execPath} ${path.join(runtimeDir, "server.mjs")}
+Restart=always
+RestartSec=1
+Environment=HOME=${os.homedir()}
+Environment=PATH=${process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin"}
+Environment=LISTEN_HOST=127.0.0.1
+Environment=LISTEN_PORT=${port}
+Environment=TARGET_HOST=api.openai.com
+Environment=TARGET_PORT=443
+Environment=DEFAULT_UPSTREAM_ORIGIN=https://api.openai.com
+Environment=CERT_PATH=${path.join(runtimeDir, "api.openai.com.crt")}
+Environment=KEY_PATH=${path.join(runtimeDir, "api.openai.com.key")}
+StandardOutput=append:${path.join(logDir, "openai-compatible-facade.log")}
+StandardError=append:${path.join(logDir, "openai-compatible-facade.err.log")}
+
+[Install]
+WantedBy=default.target
+`;
+  writeFile(unitPath, contents);
+}
+
+function writeGatewaySystemdOverride(dropInPath, caPath, proxyPort) {
+  const contents = `[Service]
+Environment=NODE_EXTRA_CA_CERTS=${caPath}
+Environment=HTTP_PROXY=http://127.0.0.1:${proxyPort}
+Environment=HTTPS_PROXY=http://127.0.0.1:${proxyPort}
+Environment=NO_PROXY=127.0.0.1,localhost
+`;
+  writeFile(dropInPath, contents);
 }
 
 function generateCerts(runtimeDir) {
@@ -223,15 +289,6 @@ function generateCerts(runtimeDir) {
   return { caCrt };
 }
 
-function updateGatewayPlist(gatewayPlist, caPath, proxyPort) {
-  if (!fs.existsSync(gatewayPlist)) fail(`gateway plist not found: ${gatewayPlist}`);
-  ensurePlistDict(gatewayPlist, ":EnvironmentVariables");
-  setPlistString(gatewayPlist, ":EnvironmentVariables:NODE_EXTRA_CA_CERTS", caPath);
-  setPlistString(gatewayPlist, ":EnvironmentVariables:HTTP_PROXY", `http://127.0.0.1:${proxyPort}`);
-  setPlistString(gatewayPlist, ":EnvironmentVariables:HTTPS_PROXY", `http://127.0.0.1:${proxyPort}`);
-  setPlistString(gatewayPlist, ":EnvironmentVariables:NO_PROXY", "127.0.0.1,localhost");
-}
-
 function updateProviderConfigFile(filePath, maps) {
   if (!fs.existsSync(filePath)) return false;
   const raw = fs.readFileSync(filePath, "utf8");
@@ -266,7 +323,7 @@ function updateProviderConfigFile(filePath, maps) {
   return true;
 }
 
-function isServiceLoaded(label) {
+function isMacServiceLoaded(label) {
   const domain = `gui/${process.getuid()}`;
   const result = run("launchctl", ["print", `${domain}/${label}`], {
     allowFailure: true,
@@ -275,9 +332,9 @@ function isServiceLoaded(label) {
   return result.status === 0;
 }
 
-function reloadService(label, plistPath) {
+function reloadMacService(label, plistPath) {
   const domain = `gui/${process.getuid()}`;
-  if (isServiceLoaded(label)) {
+  if (isMacServiceLoaded(label)) {
     run("launchctl", ["bootout", `${domain}/${label}`], { allowFailure: true });
   }
   const bootstrapResult = run("launchctl", ["bootstrap", domain, plistPath], {
@@ -285,8 +342,24 @@ function reloadService(label, plistPath) {
     capture: true
   });
   if (bootstrapResult.status === 0) return;
-  if (isServiceLoaded(label)) return;
+  if (isMacServiceLoaded(label)) return;
   throw new Error(`launchctl bootstrap failed for ${label}${bootstrapResult.stderr ? `: ${bootstrapResult.stderr.trim()}` : ""}`);
+}
+
+function assertSystemctlUserAvailable() {
+  const result = run("systemctl", ["--user", "--version"], {
+    allowFailure: true,
+    capture: true
+  });
+  if (result.status === 0) return;
+  fail("systemctl --user is not available. On Debian/Ubuntu, make sure you have a systemd user session and can run `systemctl --user status`.");
+}
+
+function reloadLinuxServices(facadeUnitName, gatewayUnitName) {
+  assertSystemctlUserAvailable();
+  run("systemctl", ["--user", "daemon-reload"]);
+  run("systemctl", ["--user", "enable", "--now", facadeUnitName]);
+  run("systemctl", ["--user", "restart", gatewayUnitName]);
 }
 
 function main() {
@@ -294,9 +367,13 @@ function main() {
   const runtimeDir = path.join(options.stateDir, "local-proxies", "openai-compatible-facade");
   const logDir = path.join(options.stateDir, "logs");
   const backupDir = path.join(runtimeDir, "backups");
-  const facadePlist = path.join(os.homedir(), "Library/LaunchAgents", `${options.facadeLabel}.plist`);
   const configPath = path.join(options.stateDir, "openclaw.json");
   const modelsPath = path.join(options.stateDir, "agents", "main", "agent", "models.json");
+  const facadePlist = path.join(os.homedir(), "Library/LaunchAgents", `${options.facadeLabel}.plist`);
+  const facadeUnitName = `${options.facadeLabel}.service`;
+  const facadeUnitPath = path.join(options.systemdUserDir, facadeUnitName);
+  const gatewayOverrideDir = path.join(options.systemdUserDir, `${options.gatewayUnit}.d`);
+  const gatewayOverridePath = path.join(gatewayOverrideDir, "openai-compatible-facade.conf");
 
   ensureDir(runtimeDir);
   ensureDir(logDir);
@@ -306,34 +383,55 @@ function main() {
   copyFile(path.join(repoRoot, "assets", "api.openai.com.ext"), path.join(runtimeDir, "api.openai.com.ext"));
 
   const { caCrt } = generateCerts(runtimeDir);
-  writeFacadeLaunchAgent(facadePlist, runtimeDir, logDir, options.proxyPort, options.facadeLabel);
+
+  if (options.platform === "macos") {
+    writeFacadeLaunchAgent(facadePlist, runtimeDir, logDir, options.proxyPort, options.facadeLabel);
+  } else {
+    ensureDir(options.systemdUserDir);
+    writeFacadeSystemdUnit(facadeUnitPath, runtimeDir, logDir, options.proxyPort);
+  }
 
   const configBackup = backupFile(configPath, backupDir);
-  const gatewayBackup = backupFile(options.gatewayPlist, backupDir);
-  const modelsBackup = fs.existsSync(modelsPath) ? backupFile(modelsPath, backupDir) : null;
+  const gatewayBackup = options.platform === "macos"
+    ? backupFile(options.gatewayPlist, backupDir)
+    : backupFile(gatewayOverridePath, backupDir);
+  const modelsBackup = backupFile(modelsPath, backupDir);
 
   const configChanged = updateProviderConfigFile(configPath, options.maps);
   if (!configChanged) fail(`no matching provider keys found in ${configPath}`);
   updateProviderConfigFile(modelsPath, options.maps);
-  updateGatewayPlist(options.gatewayPlist, caCrt, options.proxyPort);
 
-  if (!options.noReload) {
-    reloadService(options.facadeLabel, facadePlist);
-    reloadService("ai.openclaw.gateway", options.gatewayPlist);
+  if (options.platform === "macos") {
+    if (!fs.existsSync(options.gatewayPlist)) fail(`gateway plist not found: ${options.gatewayPlist}`);
+    ensurePlistDict(options.gatewayPlist, ":EnvironmentVariables");
+    setPlistString(options.gatewayPlist, ":EnvironmentVariables:NODE_EXTRA_CA_CERTS", caCrt);
+    setPlistString(options.gatewayPlist, ":EnvironmentVariables:HTTP_PROXY", `http://127.0.0.1:${options.proxyPort}`);
+    setPlistString(options.gatewayPlist, ":EnvironmentVariables:HTTPS_PROXY", `http://127.0.0.1:${options.proxyPort}`);
+    setPlistString(options.gatewayPlist, ":EnvironmentVariables:NO_PROXY", "127.0.0.1,localhost");
+    if (!options.noReload) {
+      reloadMacService(options.facadeLabel, facadePlist);
+      reloadMacService("ai.openclaw.gateway", options.gatewayPlist);
+    }
+  } else {
+    ensureDir(gatewayOverrideDir);
+    writeGatewaySystemdOverride(gatewayOverridePath, caCrt, options.proxyPort);
+    if (!options.noReload) reloadLinuxServices(facadeUnitName, options.gatewayUnit);
   }
 
   console.log("");
   console.log("Install completed.");
-  console.log(`Config backup : ${configBackup}`);
-  console.log(`Gateway backup: ${gatewayBackup}`);
+  if (configBackup) console.log(`Config backup : ${configBackup}`);
+  if (gatewayBackup) console.log(`Gateway backup: ${gatewayBackup}`);
   if (modelsBackup) console.log(`Models backup : ${modelsBackup}`);
-  console.log(`Facade plist  : ${facadePlist}`);
   console.log(`Facade CA     : ${caCrt}`);
+  if (options.platform === "macos") console.log(`Facade plist  : ${facadePlist}`);
+  else {
+    console.log(`Facade unit   : ${facadeUnitPath}`);
+    console.log(`Gateway drop-in: ${gatewayOverridePath}`);
+  }
   console.log("");
   console.log("Applied maps:");
-  for (const map of options.maps) {
-    console.log(`- ${map.providerKey} -> ${map.upstream}`);
-  }
+  for (const map of options.maps) console.log(`- ${map.providerKey} -> ${map.upstream}`);
   console.log("");
   console.log("Next checks:");
   console.log("- openclaw status");

@@ -5,6 +5,7 @@
 - First public version.
 - Added a generic local facade proxy for OpenClaw OpenAI-compatible `Responses` providers.
 - Added one-click install and uninstall scripts for macOS LaunchAgent deployments.
+- Added Debian / Ubuntu support through `systemd --user`.
 - Added Chinese documentation for installation, verification, rollback, and caveats.
 - Verified end-to-end cache-read recovery for `custom-beehears`.
 - Verified multi-provider facade routing for `custom-beehears` and `custom-memory`.
