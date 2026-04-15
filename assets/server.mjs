@@ -11,6 +11,7 @@ const LISTEN_PORT = Number.parseInt(process.env.LISTEN_PORT || "19876", 10);
 const DEFAULT_UPSTREAM_ORIGIN = process.env.DEFAULT_UPSTREAM_ORIGIN || "https://api.openai.com";
 const CERT_PATH = process.env.CERT_PATH;
 const KEY_PATH = process.env.KEY_PATH;
+const ROUTE_MAP_JSON = process.env.ROUTE_MAP_JSON || "{}";
 const INTERNAL_UPSTREAM_HEADER = "x-openclaw-facade-upstream";
 const INTERNAL_PROVIDER_HEADER = "x-openclaw-facade-provider";
 
@@ -39,6 +40,35 @@ function log(message, extra = {}) {
   process.stdout.write(`${now()} ${message}${details}\n`);
 }
 
+function normalizeOrigin(value, fallback) {
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("unsupported protocol");
+    return parsed.origin;
+  } catch {
+    if (fallback !== undefined) return fallback;
+    throw new Error(`invalid upstream origin: ${value}`);
+  }
+}
+
+function parseRouteMap(raw) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("ROUTE_MAP_JSON must be valid JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("ROUTE_MAP_JSON must be a JSON object");
+  const out = {};
+  for (const [providerKey, upstream] of Object.entries(parsed)) {
+    if (typeof upstream !== "string" || upstream.trim() === "") continue;
+    out[providerKey] = normalizeOrigin(upstream);
+  }
+  return out;
+}
+
+const routeMap = parseRouteMap(ROUTE_MAP_JSON);
+
 function stripInternalAndHopHeaders(headers) {
   const out = {};
   for (const [key, value] of Object.entries(headers)) {
@@ -54,13 +84,25 @@ function stripInternalAndHopHeaders(headers) {
 function resolveFacadeRoute(req) {
   const provider = typeof req.headers[INTERNAL_PROVIDER_HEADER] === "string" ? req.headers[INTERNAL_PROVIDER_HEADER] : undefined;
   const rawUpstream = typeof req.headers[INTERNAL_UPSTREAM_HEADER] === "string" ? req.headers[INTERNAL_UPSTREAM_HEADER] : DEFAULT_UPSTREAM_ORIGIN;
-  let upstreamBase;
-  try {
-    upstreamBase = new URL(rawUpstream);
-  } catch {
-    upstreamBase = new URL(DEFAULT_UPSTREAM_ORIGIN);
+  if (!provider && req.headers[INTERNAL_UPSTREAM_HEADER] !== undefined) {
+    throw new Error("facade upstream override requires a provider id");
   }
-  return { provider, upstreamBase };
+  if (provider) {
+    const expectedOrigin = routeMap[provider];
+    if (!expectedOrigin) throw new Error(`provider is not registered in ROUTE_MAP_JSON: ${provider}`);
+    const normalizedIncomingOrigin = normalizeOrigin(rawUpstream, expectedOrigin);
+    if (normalizedIncomingOrigin !== expectedOrigin) {
+      throw new Error(`provider upstream mismatch for ${provider}`);
+    }
+    return {
+      provider,
+      upstreamBase: new URL(expectedOrigin)
+    };
+  }
+  return {
+    provider: undefined,
+    upstreamBase: new URL(normalizeOrigin(DEFAULT_UPSTREAM_ORIGIN))
+  };
 }
 
 function upstreamUrlFromRequest(req) {
@@ -105,15 +147,25 @@ function forwardRequest(req, res, upstreamUrl, hostHeader) {
 }
 
 function proxyFacadeRequest(req, res) {
-  const upstreamUrl = upstreamUrlFromRequest(req);
-  const route = resolveFacadeRoute(req);
-  log("facade request", {
-    method: req.method,
-    url: req.url,
-    provider: route.provider ?? null,
-    upstream: route.upstreamBase.origin
-  });
-  forwardRequest(req, res, upstreamUrl, upstreamUrl.host);
+  try {
+    const upstreamUrl = upstreamUrlFromRequest(req);
+    const route = resolveFacadeRoute(req);
+    log("facade request", {
+      method: req.method,
+      url: req.url,
+      provider: route.provider ?? null,
+      upstream: route.upstreamBase.origin
+    });
+    forwardRequest(req, res, upstreamUrl, upstreamUrl.host);
+  } catch (error) {
+    log("facade request rejected", {
+      method: req.method,
+      url: req.url,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    res.writeHead(403, { "content-type": "text/plain; charset=utf-8" });
+    res.end("OpenAI facade route rejected");
+  }
 }
 
 function proxyGenericRequest(req, res) {

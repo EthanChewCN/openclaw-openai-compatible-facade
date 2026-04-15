@@ -117,16 +117,25 @@ function run(cmd, cmdArgs, options = {}) {
   return result;
 }
 
-function ensureDir(dirPath) {
-  fs.mkdirSync(dirPath, { recursive: true });
+function chmodIfExists(filePath, mode) {
+  try {
+    fs.chmodSync(filePath, mode);
+  } catch {}
 }
 
-function copyFile(src, dest) {
+function ensureDir(dirPath, mode = 0o700) {
+  fs.mkdirSync(dirPath, { recursive: true, mode });
+  chmodIfExists(dirPath, mode);
+}
+
+function copyFile(src, dest, mode = 0o600) {
   fs.copyFileSync(src, dest);
+  chmodIfExists(dest, mode);
 }
 
-function writeFile(dest, contents) {
-  fs.writeFileSync(dest, contents, "utf8");
+function writeFile(dest, contents, mode = 0o600) {
+  fs.writeFileSync(dest, contents, { encoding: "utf8", mode });
+  chmodIfExists(dest, mode);
 }
 
 function timestamp() {
@@ -135,9 +144,10 @@ function timestamp() {
 
 function backupFile(filePath, backupDir) {
   if (!fs.existsSync(filePath)) return null;
-  ensureDir(backupDir);
+  ensureDir(backupDir, 0o700);
   const backupPath = path.join(backupDir, `${path.basename(filePath)}.${timestamp()}.bak`);
   fs.copyFileSync(filePath, backupPath);
+  chmodIfExists(backupPath, 0o600);
   return backupPath;
 }
 
@@ -154,13 +164,31 @@ function setPlistString(plistPath, keyPath, value) {
   plistBuddy(plistPath, `Add ${keyPath} string ${value}`);
 }
 
+function removePlistKey(plistPath, keyPath) {
+  plistBuddy(plistPath, `Delete ${keyPath}`, true);
+}
+
 function ensurePlistDict(plistPath, keyPath) {
   const printResult = plistBuddy(plistPath, `Print ${keyPath}`, true);
   if (printResult.status === 0) return;
   plistBuddy(plistPath, `Add ${keyPath} dict`);
 }
 
-function writeFacadeLaunchAgent(plistPath, runtimeDir, logDir, port, label) {
+function readMacGatewayEnv(plistPath) {
+  const result = run("plutil", ["-convert", "json", "-o", "-", plistPath], {
+    allowFailure: true,
+    capture: true
+  });
+  if (result.status !== 0) return {};
+  const parsed = JSON.parse(result.stdout || "{}");
+  return parsed.EnvironmentVariables || {};
+}
+
+function quoteSystemdArg(value) {
+  return `"${String(value).replace(/(["\\])/g, "\\$1")}"`;
+}
+
+function writeFacadeLaunchAgent(plistPath, runtimeDir, logDir, port, label, routeMapJson) {
   const contents = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -198,6 +226,8 @@ function writeFacadeLaunchAgent(plistPath, runtimeDir, logDir, port, label) {
       <string>443</string>
       <key>DEFAULT_UPSTREAM_ORIGIN</key>
       <string>https://api.openai.com</string>
+      <key>ROUTE_MAP_JSON</key>
+      <string>${routeMapJson}</string>
       <key>CERT_PATH</key>
       <string>${path.join(runtimeDir, "api.openai.com.crt")}</string>
       <key>KEY_PATH</key>
@@ -206,10 +236,10 @@ function writeFacadeLaunchAgent(plistPath, runtimeDir, logDir, port, label) {
   </dict>
 </plist>
 `;
-  writeFile(plistPath, contents);
+  writeFile(plistPath, contents, 0o644);
 }
 
-function writeFacadeSystemdUnit(unitPath, runtimeDir, logDir, port) {
+function writeFacadeSystemdUnit(unitPath, runtimeDir, logDir, port, routeMapJson) {
   const contents = `[Unit]
 Description=OpenClaw OpenAI-Compatible Facade
 After=network-online.target
@@ -217,35 +247,36 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${process.execPath} ${path.join(runtimeDir, "server.mjs")}
+ExecStart=${quoteSystemdArg(process.execPath)} ${quoteSystemdArg(path.join(runtimeDir, "server.mjs"))}
 Restart=always
 RestartSec=1
-Environment=HOME=${os.homedir()}
-Environment=PATH=${process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin"}
+Environment=HOME=${quoteSystemdArg(os.homedir())}
+Environment=PATH=${quoteSystemdArg(process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin")}
 Environment=LISTEN_HOST=127.0.0.1
 Environment=LISTEN_PORT=${port}
 Environment=TARGET_HOST=api.openai.com
 Environment=TARGET_PORT=443
 Environment=DEFAULT_UPSTREAM_ORIGIN=https://api.openai.com
-Environment=CERT_PATH=${path.join(runtimeDir, "api.openai.com.crt")}
-Environment=KEY_PATH=${path.join(runtimeDir, "api.openai.com.key")}
+Environment=ROUTE_MAP_JSON=${quoteSystemdArg(routeMapJson)}
+Environment=CERT_PATH=${quoteSystemdArg(path.join(runtimeDir, "api.openai.com.crt"))}
+Environment=KEY_PATH=${quoteSystemdArg(path.join(runtimeDir, "api.openai.com.key"))}
 StandardOutput=append:${path.join(logDir, "openai-compatible-facade.log")}
 StandardError=append:${path.join(logDir, "openai-compatible-facade.err.log")}
 
 [Install]
 WantedBy=default.target
 `;
-  writeFile(unitPath, contents);
+  writeFile(unitPath, contents, 0o644);
 }
 
 function writeGatewaySystemdOverride(dropInPath, caPath, proxyPort) {
   const contents = `[Service]
-Environment=NODE_EXTRA_CA_CERTS=${caPath}
+Environment=NODE_EXTRA_CA_CERTS=${quoteSystemdArg(caPath)}
 Environment=HTTP_PROXY=http://127.0.0.1:${proxyPort}
 Environment=HTTPS_PROXY=http://127.0.0.1:${proxyPort}
 Environment=NO_PROXY=127.0.0.1,localhost
 `;
-  writeFile(dropInPath, contents);
+  writeFile(dropInPath, contents, 0o644);
 }
 
 function generateCerts(runtimeDir) {
@@ -286,6 +317,13 @@ function generateCerts(runtimeDir) {
     ]);
   }
 
+  chmodIfExists(caKey, 0o600);
+  chmodIfExists(caCrt, 0o600);
+  chmodIfExists(leafKey, 0o600);
+  chmodIfExists(leafCsr, 0o600);
+  chmodIfExists(leafCrt, 0o600);
+  chmodIfExists(extPath, 0o600);
+
   return { caCrt };
 }
 
@@ -311,15 +349,13 @@ function updateProviderConfigFile(filePath, maps) {
       "X-OpenClaw-Facade-Provider": map.providerKey
     };
     if (Array.isArray(provider.models)) {
-      for (const model of provider.models) {
-        model.api = "openai-responses";
-      }
+      for (const model of provider.models) model.api = "openai-responses";
     }
     changed = true;
   }
 
   if (!changed) return false;
-  fs.writeFileSync(filePath, `${JSON.stringify(json, null, 2)}\n`, "utf8");
+  writeFile(filePath, `${JSON.stringify(json, null, 2)}\n`, 0o600);
   return true;
 }
 
@@ -362,11 +398,46 @@ function reloadLinuxServices(facadeUnitName, gatewayUnitName) {
   run("systemctl", ["--user", "restart", gatewayUnitName]);
 }
 
+function buildInstallState(options, caCrt, routeMapJson, gatewaySnapshot) {
+  return {
+    version: 1,
+    platform: options.platform,
+    generatedAt: new Date().toISOString(),
+    maps: options.maps,
+    proxyPort: options.proxyPort,
+    facadeLabel: options.facadeLabel,
+    gatewayPlist: options.gatewayPlist,
+    gatewayUnit: options.gatewayUnit,
+    systemdUserDir: options.systemdUserDir,
+    caPath: caCrt,
+    routeMapJson,
+    gatewaySnapshot
+  };
+}
+
+function readGatewaySnapshot(options, gatewayOverridePath) {
+  if (options.platform === "macos") {
+    const env = readMacGatewayEnv(options.gatewayPlist);
+    return {
+      environment: {
+        NODE_EXTRA_CA_CERTS: env.NODE_EXTRA_CA_CERTS ?? null,
+        HTTP_PROXY: env.HTTP_PROXY ?? null,
+        HTTPS_PROXY: env.HTTPS_PROXY ?? null,
+        NO_PROXY: env.NO_PROXY ?? null
+      }
+    };
+  }
+  return {
+    gatewayOverrideContent: fs.existsSync(gatewayOverridePath) ? fs.readFileSync(gatewayOverridePath, "utf8") : null
+  };
+}
+
 function main() {
   const options = parseArgs(args);
   const runtimeDir = path.join(options.stateDir, "local-proxies", "openai-compatible-facade");
   const logDir = path.join(options.stateDir, "logs");
   const backupDir = path.join(runtimeDir, "backups");
+  const installStatePath = path.join(runtimeDir, "install-state.json");
   const configPath = path.join(options.stateDir, "openclaw.json");
   const modelsPath = path.join(options.stateDir, "agents", "main", "agent", "models.json");
   const facadePlist = path.join(os.homedir(), "Library/LaunchAgents", `${options.facadeLabel}.plist`);
@@ -375,20 +446,22 @@ function main() {
   const gatewayOverrideDir = path.join(options.systemdUserDir, `${options.gatewayUnit}.d`);
   const gatewayOverridePath = path.join(gatewayOverrideDir, "openai-compatible-facade.conf");
 
-  ensureDir(runtimeDir);
-  ensureDir(logDir);
-  ensureDir(backupDir);
+  ensureDir(runtimeDir, 0o700);
+  ensureDir(logDir, 0o700);
+  ensureDir(backupDir, 0o700);
 
-  copyFile(path.join(repoRoot, "assets", "server.mjs"), path.join(runtimeDir, "server.mjs"));
-  copyFile(path.join(repoRoot, "assets", "api.openai.com.ext"), path.join(runtimeDir, "api.openai.com.ext"));
+  copyFile(path.join(repoRoot, "assets", "server.mjs"), path.join(runtimeDir, "server.mjs"), 0o600);
+  copyFile(path.join(repoRoot, "assets", "api.openai.com.ext"), path.join(runtimeDir, "api.openai.com.ext"), 0o600);
 
   const { caCrt } = generateCerts(runtimeDir);
+  const routeMap = Object.fromEntries(options.maps.map((map) => [map.providerKey, map.upstream]));
+  const routeMapJson = JSON.stringify(routeMap).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
   if (options.platform === "macos") {
-    writeFacadeLaunchAgent(facadePlist, runtimeDir, logDir, options.proxyPort, options.facadeLabel);
+    writeFacadeLaunchAgent(facadePlist, runtimeDir, logDir, options.proxyPort, options.facadeLabel, routeMapJson);
   } else {
-    ensureDir(options.systemdUserDir);
-    writeFacadeSystemdUnit(facadeUnitPath, runtimeDir, logDir, options.proxyPort);
+    ensureDir(options.systemdUserDir, 0o700);
+    writeFacadeSystemdUnit(facadeUnitPath, runtimeDir, logDir, options.proxyPort, routeMapJson);
   }
 
   const configBackup = backupFile(configPath, backupDir);
@@ -396,6 +469,7 @@ function main() {
     ? backupFile(options.gatewayPlist, backupDir)
     : backupFile(gatewayOverridePath, backupDir);
   const modelsBackup = backupFile(modelsPath, backupDir);
+  const gatewaySnapshot = readGatewaySnapshot(options, gatewayOverridePath);
 
   const configChanged = updateProviderConfigFile(configPath, options.maps);
   if (!configChanged) fail(`no matching provider keys found in ${configPath}`);
@@ -408,15 +482,19 @@ function main() {
     setPlistString(options.gatewayPlist, ":EnvironmentVariables:HTTP_PROXY", `http://127.0.0.1:${options.proxyPort}`);
     setPlistString(options.gatewayPlist, ":EnvironmentVariables:HTTPS_PROXY", `http://127.0.0.1:${options.proxyPort}`);
     setPlistString(options.gatewayPlist, ":EnvironmentVariables:NO_PROXY", "127.0.0.1,localhost");
+    chmodIfExists(options.gatewayPlist, 0o600);
     if (!options.noReload) {
       reloadMacService(options.facadeLabel, facadePlist);
       reloadMacService("ai.openclaw.gateway", options.gatewayPlist);
     }
   } else {
-    ensureDir(gatewayOverrideDir);
+    ensureDir(gatewayOverrideDir, 0o700);
     writeGatewaySystemdOverride(gatewayOverridePath, caCrt, options.proxyPort);
     if (!options.noReload) reloadLinuxServices(facadeUnitName, options.gatewayUnit);
   }
+
+  const installState = buildInstallState(options, caCrt, JSON.stringify(routeMap), gatewaySnapshot);
+  writeFile(installStatePath, `${JSON.stringify(installState, null, 2)}\n`, 0o600);
 
   console.log("");
   console.log("Install completed.");

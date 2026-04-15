@@ -13,7 +13,7 @@
 - OpenClaw 主对话 / Agent 路径
 - 第三方 OpenAI-compatible `Responses` provider
 - macOS + LaunchAgent
-- Debian / Ubuntu + `systemd --user`
+- Debian / Ubuntu + `systemd --user`（实验性）
 
 ## 背景
 
@@ -98,7 +98,7 @@ openclaw agent --agent main --message "reply with exactly ok" --json --timeout 6
 
 1. 在 `~/.openclaw/local-proxies/openai-compatible-facade` 下创建运行目录
 2. 生成本地 CA 和 `api.openai.com` 叶子证书
-3. 安装 facade 的 LaunchAgent
+3. 安装 facade 服务
 4. 修改 OpenClaw Gateway 的运行时环境：
    - `NODE_EXTRA_CA_CERTS`
    - `HTTP_PROXY`
@@ -112,7 +112,8 @@ openclaw agent --agent main --message "reply with exactly ok" --json --timeout 6
    - 注入 `X-OpenClaw-Facade-Upstream`
    - 注入 `X-OpenClaw-Facade-Provider`
 6. 尝试同步 `~/.openclaw/agents/main/agent/models.json`
-7. 重载 facade 和 Gateway 服务
+7. 记录安装前的 Gateway 环境快照，用于卸载时恢复
+8. 重载 facade 和 Gateway 服务
 
 ## 配置结果示例
 
@@ -204,8 +205,7 @@ bash scripts/uninstall.sh \
 
 - 把 provider 的 `baseUrl` 改回真实上游
 - 删除 facade 注入的请求头
-- 删除 `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`
-- 把 `NODE_EXTRA_CA_CERTS` 重置为 `/etc/ssl/cert.pem`
+- 按安装时记录的快照恢复 Gateway 的代理和 CA 环境
 - 停掉 facade 服务
 - 重载 Gateway
 
@@ -245,7 +245,7 @@ Gateway 进程会带：
 
 Linux 版本按 Debian / Ubuntu 的 `systemd --user` 服务方式实现。
 
-这部分支持已经写进安装/卸载脚本，但当前仓库是在 macOS 环境下完成开发和自检的；如果你准备在 Debian 或 Ubuntu 上使用，建议先在测试机上完整跑一遍安装、验证和回滚流程。
+这部分支持已经写进安装/卸载脚本，但当前仓库是在 macOS 环境下完成开发和自检的；如果你准备在 Debian 或 Ubuntu 上使用，建议先在测试机上完整跑一遍安装、验证和回滚流程，再用于正式环境。
 
 如果你的环境不能正常运行：
 

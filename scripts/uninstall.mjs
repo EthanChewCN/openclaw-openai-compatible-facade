@@ -113,14 +113,14 @@ function plistBuddy(plistPath, command) {
   });
 }
 
-function removePlistKey(plistPath, keyPath) {
-  plistBuddy(plistPath, `Delete ${keyPath}`);
-}
-
 function setPlistString(plistPath, keyPath, value) {
   const setResult = plistBuddy(plistPath, `Set ${keyPath} ${value}`);
   if (setResult.status === 0) return;
   run("/usr/libexec/PlistBuddy", ["-c", `Add ${keyPath} string ${value}`, plistPath]);
+}
+
+function removePlistKey(plistPath, keyPath) {
+  plistBuddy(plistPath, `Delete ${keyPath}`);
 }
 
 function updateProviderConfigFile(filePath, maps) {
@@ -141,8 +141,44 @@ function updateProviderConfigFile(filePath, maps) {
     changed = true;
   }
   if (!changed) return false;
-  fs.writeFileSync(filePath, `${JSON.stringify(json, null, 2)}\n`, "utf8");
+  fs.writeFileSync(filePath, `${JSON.stringify(json, null, 2)}\n`, { mode: 0o600 });
   return true;
+}
+
+function readInstallState(installStatePath) {
+  if (!fs.existsSync(installStatePath)) fail(`install state not found: ${installStatePath}`);
+  return JSON.parse(fs.readFileSync(installStatePath, "utf8"));
+}
+
+function restoreMacGatewayEnv(plistPath, snapshot) {
+  const env = snapshot?.environment;
+  if (!env) fail("missing macOS gateway environment snapshot in install-state.json");
+  const entries = ["NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"];
+  for (const key of entries) {
+    const value = env[key];
+    const keyPath = `:EnvironmentVariables:${key}`;
+    if (value === null || value === undefined || value === "") removePlistKey(plistPath, keyPath);
+    else setPlistString(plistPath, keyPath, value);
+  }
+  try {
+    fs.chmodSync(plistPath, 0o600);
+  } catch {}
+}
+
+function restoreLinuxGatewayOverride(gatewayOverridePath, snapshot) {
+  if (!snapshot || !Object.prototype.hasOwnProperty.call(snapshot, "gatewayOverrideContent")) {
+    fail("missing Linux gateway override snapshot in install-state.json");
+  }
+  const previous = snapshot.gatewayOverrideContent;
+  if (previous === null) {
+    if (fs.existsSync(gatewayOverridePath)) fs.unlinkSync(gatewayOverridePath);
+    const dir = path.dirname(gatewayOverridePath);
+    if (fs.existsSync(dir) && fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+    return;
+  }
+  const dir = path.dirname(gatewayOverridePath);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(gatewayOverridePath, previous, { mode: 0o644 });
 }
 
 function reloadMacService(label, plistPath) {
@@ -170,29 +206,28 @@ function main() {
   const options = parseArgs(args);
   const configPath = path.join(options.stateDir, "openclaw.json");
   const modelsPath = path.join(options.stateDir, "agents", "main", "agent", "models.json");
+  const runtimeDir = path.join(options.stateDir, "local-proxies", "openai-compatible-facade");
+  const installStatePath = path.join(runtimeDir, "install-state.json");
   const facadePlist = path.join(os.homedir(), "Library/LaunchAgents", `${options.facadeLabel}.plist`);
   const facadeUnitName = `${options.facadeLabel}.service`;
   const facadeUnitPath = path.join(options.systemdUserDir, facadeUnitName);
   const gatewayOverridePath = path.join(options.systemdUserDir, `${options.gatewayUnit}.d`, "openai-compatible-facade.conf");
+  const installState = readInstallState(installStatePath);
 
   updateProviderConfigFile(configPath, options.maps);
   updateProviderConfigFile(modelsPath, options.maps);
 
   if (options.platform === "macos") {
-    removePlistKey(options.gatewayPlist, ":EnvironmentVariables:HTTP_PROXY");
-    removePlistKey(options.gatewayPlist, ":EnvironmentVariables:HTTPS_PROXY");
-    removePlistKey(options.gatewayPlist, ":EnvironmentVariables:NO_PROXY");
-    setPlistString(options.gatewayPlist, ":EnvironmentVariables:NODE_EXTRA_CA_CERTS", "/etc/ssl/cert.pem");
+    restoreMacGatewayEnv(options.gatewayPlist, installState.gatewaySnapshot);
     if (!options.noReload) {
       const domain = `gui/${process.getuid()}`;
       run("launchctl", ["bootout", `${domain}/${options.facadeLabel}`], { allowFailure: true });
       reloadMacService("ai.openclaw.gateway", options.gatewayPlist);
     }
+    if (fs.existsSync(facadePlist)) fs.unlinkSync(facadePlist);
   } else {
     if (fs.existsSync(facadeUnitPath)) fs.unlinkSync(facadeUnitPath);
-    if (fs.existsSync(gatewayOverridePath)) fs.unlinkSync(gatewayOverridePath);
-    const gatewayOverrideDir = path.dirname(gatewayOverridePath);
-    if (fs.existsSync(gatewayOverrideDir) && fs.readdirSync(gatewayOverrideDir).length === 0) fs.rmdirSync(gatewayOverrideDir);
+    restoreLinuxGatewayOverride(gatewayOverridePath, installState.gatewaySnapshot);
     if (!options.noReload) {
       assertSystemctlUserAvailable();
       run("systemctl", ["--user", "disable", "--now", facadeUnitName], { allowFailure: true });
