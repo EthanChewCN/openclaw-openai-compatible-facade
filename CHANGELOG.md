@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 - 2026-04-15
+
+- Hardened facade routing by enforcing provider-to-upstream allowlist matching.
+- Added install-state snapshots and symmetric restore handling for Gateway environment changes.
+- Tightened permissions for generated runtime and backup files.
+- Added explicit macOS post-install verification so install no longer reports success before the facade and Gateway are reachable.
+- Updated release notes and documentation to reflect the hardened behavior and current support boundaries.
+
 ## 0.1.0 - 2026-04-15
 
 - First public version.
