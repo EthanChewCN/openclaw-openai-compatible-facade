@@ -10,8 +10,10 @@
 - 面向 OpenClaw provider 的一键安装脚本
 - 对应的一键回滚脚本
 - macOS `LaunchAgent` 支持
-- Debian / Ubuntu `systemd --user` 支持
+- Debian / Ubuntu `systemd --user` 支持（实验性）
 - 中文使用文档
+- provider -> upstream 白名单校验
+- 安装前 Gateway 环境快照与卸载恢复逻辑
 
 ## 这个版本解决什么
 
@@ -32,11 +34,18 @@
 - 这不是通用兼容层，只面向 OpenAI-compatible `Responses` provider
 - provider 是否适合作为主聊天模型，仍取决于它自己的 key、模型配额、稳定性和能力边界
 - Linux 支持已经进脚本，但当前仓库是在 macOS 环境下完成开发和自检的；如果要在 Debian 或 Ubuntu 上使用，建议先在测试机上跑完整安装、验证和回滚流程
+- Gateway 仍然会全局带 `HTTP_PROXY` / `HTTPS_PROXY`，facade 仍是当前出站路径的一部分
 
 ## 升级和维护建议
 
 - OpenClaw 升级后，建议重新做一次最小验证
 - 如果未来 OpenClaw 原生支持这类第三方 `Responses` provider 的 prompt cache forwarding，这个仓库的价值会下降，届时更适合切回官方能力
+
+## 当前实现补充
+
+- facade 现在会校验 provider 与上游地址是否匹配，不再接受任意 header 指向任意第三方上游
+- 安装脚本会把敏感配置备份到权限收紧的目录中
+- 卸载脚本会按安装时记录的快照恢复 Gateway 环境，而不是写死回默认值
 
 ## 仓库说明
 
