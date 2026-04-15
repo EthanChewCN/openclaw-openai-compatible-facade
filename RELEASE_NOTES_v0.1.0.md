@@ -42,4 +42,3 @@
 
 - README 面向使用者，解释安装、验证、回滚和限制
 - CHANGELOG 记录版本级变化
-- 这个 release notes 文件适合直接复制到 GitHub Release 页面
