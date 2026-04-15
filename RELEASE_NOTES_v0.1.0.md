@@ -14,6 +14,7 @@
 - 中文使用文档
 - provider -> upstream 白名单校验
 - 安装前 Gateway 环境快照与卸载恢复逻辑
+- macOS 安装后会显式验证 facade 和 Gateway 已真正可达
 
 ## 这个版本解决什么
 
@@ -46,6 +47,7 @@
 - facade 现在会校验 provider 与上游地址是否匹配，不再接受任意 header 指向任意第三方上游
 - 安装脚本会把敏感配置备份到权限收紧的目录中
 - 卸载脚本会按安装时记录的快照恢复 Gateway 环境，而不是写死回默认值
+- macOS 安装流程不会在服务仍未 reachable 时误报成功
 
 ## 仓库说明
 

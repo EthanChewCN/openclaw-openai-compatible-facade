@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -168,6 +169,23 @@ function removePlistKey(plistPath, keyPath) {
   plistBuddy(plistPath, `Delete ${keyPath}`, true);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function readMacPlistJson(plistPath) {
+  const result = run("plutil", ["-convert", "json", "-o", "-", plistPath], {
+    allowFailure: true,
+    capture: true
+  });
+  if (result.status !== 0) return null;
+  try {
+    return JSON.parse(result.stdout || "{}");
+  } catch {
+    return null;
+  }
+}
+
 function ensurePlistDict(plistPath, keyPath) {
   const printResult = plistBuddy(plistPath, `Print ${keyPath}`, true);
   if (printResult.status === 0) return;
@@ -175,13 +193,21 @@ function ensurePlistDict(plistPath, keyPath) {
 }
 
 function readMacGatewayEnv(plistPath) {
-  const result = run("plutil", ["-convert", "json", "-o", "-", plistPath], {
-    allowFailure: true,
-    capture: true
-  });
-  if (result.status !== 0) return {};
-  const parsed = JSON.parse(result.stdout || "{}");
-  return parsed.EnvironmentVariables || {};
+  const parsed = readMacPlistJson(plistPath);
+  return parsed?.EnvironmentVariables || {};
+}
+
+function readMacGatewayPort(plistPath) {
+  const parsed = readMacPlistJson(plistPath);
+  const envPort = Number.parseInt(String(parsed?.EnvironmentVariables?.OPENCLAW_GATEWAY_PORT || ""), 10);
+  if (Number.isFinite(envPort) && envPort > 0) return envPort;
+  const args = Array.isArray(parsed?.ProgramArguments) ? parsed.ProgramArguments : [];
+  const portIndex = args.findIndex((entry) => entry === "--port");
+  if (portIndex >= 0 && portIndex + 1 < args.length) {
+    const argPort = Number.parseInt(String(args[portIndex + 1]), 10);
+    if (Number.isFinite(argPort) && argPort > 0) return argPort;
+  }
+  return 18789;
 }
 
 function quoteSystemdArg(value) {
@@ -368,18 +394,72 @@ function isMacServiceLoaded(label) {
   return result.status === 0;
 }
 
+function probeTcpPort(host, port, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    const socket = net.connect({ host, port });
+    let done = false;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.on("connect", () => finish(true));
+    socket.on("timeout", () => finish(false));
+    socket.on("error", () => finish(false));
+  });
+}
+
+async function waitForMacServiceLoaded(label, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (isMacServiceLoaded(label)) return true;
+    await sleep(500);
+  }
+  return false;
+}
+
+async function waitForTcpReachable(host, port, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await probeTcpPort(host, port)) return true;
+    await sleep(500);
+  }
+  return false;
+}
+
 function reloadMacService(label, plistPath) {
   const domain = `gui/${process.getuid()}`;
+  const serviceTarget = `${domain}/${label}`;
   if (isMacServiceLoaded(label)) {
-    run("launchctl", ["bootout", `${domain}/${label}`], { allowFailure: true });
+    run("launchctl", ["bootout", serviceTarget], { allowFailure: true });
   }
   const bootstrapResult = run("launchctl", ["bootstrap", domain, plistPath], {
     allowFailure: true,
     capture: true
   });
-  if (bootstrapResult.status === 0) return;
-  if (isMacServiceLoaded(label)) return;
-  throw new Error(`launchctl bootstrap failed for ${label}${bootstrapResult.stderr ? `: ${bootstrapResult.stderr.trim()}` : ""}`);
+  if (bootstrapResult.status !== 0 && !isMacServiceLoaded(label)) {
+    throw new Error(`launchctl bootstrap failed for ${label}${bootstrapResult.stderr ? `: ${bootstrapResult.stderr.trim()}` : ""}`);
+  }
+  const kickstartResult = run("launchctl", ["kickstart", "-k", serviceTarget], {
+    allowFailure: true,
+    capture: true
+  });
+  if (kickstartResult.status === 0) return;
+  throw new Error(`launchctl kickstart failed for ${label}${kickstartResult.stderr ? `: ${kickstartResult.stderr.trim()}` : ""}`);
+}
+
+async function verifyMacInstall(params) {
+  const facadeLoaded = await waitForMacServiceLoaded(params.facadeLabel, 10000);
+  if (!facadeLoaded) throw new Error(`facade service did not reach loaded state: ${params.facadeLabel}`);
+  const facadeReachable = await waitForTcpReachable("127.0.0.1", params.facadePort, 10000);
+  if (!facadeReachable) throw new Error(`facade service is not reachable on 127.0.0.1:${params.facadePort}`);
+
+  const gatewayLoaded = await waitForMacServiceLoaded(params.gatewayLabel, 15000);
+  if (!gatewayLoaded) throw new Error(`gateway service did not reach loaded state: ${params.gatewayLabel}`);
+  const gatewayReachable = await waitForTcpReachable("127.0.0.1", params.gatewayPort, 30000);
+  if (!gatewayReachable) throw new Error(`gateway is not reachable on 127.0.0.1:${params.gatewayPort}`);
 }
 
 function assertSystemctlUserAvailable() {
@@ -432,7 +512,7 @@ function readGatewaySnapshot(options, gatewayOverridePath) {
   };
 }
 
-function main() {
+async function main() {
   const options = parseArgs(args);
   const runtimeDir = path.join(options.stateDir, "local-proxies", "openai-compatible-facade");
   const logDir = path.join(options.stateDir, "logs");
@@ -483,9 +563,16 @@ function main() {
     setPlistString(options.gatewayPlist, ":EnvironmentVariables:HTTPS_PROXY", `http://127.0.0.1:${options.proxyPort}`);
     setPlistString(options.gatewayPlist, ":EnvironmentVariables:NO_PROXY", "127.0.0.1,localhost");
     chmodIfExists(options.gatewayPlist, 0o600);
+    const gatewayPort = readMacGatewayPort(options.gatewayPlist);
     if (!options.noReload) {
       reloadMacService(options.facadeLabel, facadePlist);
       reloadMacService("ai.openclaw.gateway", options.gatewayPlist);
+      await verifyMacInstall({
+        facadeLabel: options.facadeLabel,
+        facadePort: Number.parseInt(options.proxyPort, 10),
+        gatewayLabel: "ai.openclaw.gateway",
+        gatewayPort
+      });
     }
   } else {
     ensureDir(gatewayOverrideDir, 0o700);
@@ -516,4 +603,4 @@ function main() {
   console.log("- openclaw agent --agent main --message \"reply with exactly ok\" --json --timeout 60");
 }
 
-main();
+main().catch((error) => fail(error instanceof Error ? error.message : String(error)));
